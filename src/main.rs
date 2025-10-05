@@ -1,7 +1,8 @@
 use iced::widget::{button, text_input, Button, Column, Container, ProgressBar, Text, TextInput};
+use iced::{theme, Alignment, Application, Command, Element, Length};
+use rfd::FileDialog;
 
-use iced::alignment::Alignment;
-use iced::{executor, Application, Command, Element, Length};
+use iced::executor;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -11,6 +12,8 @@ enum Message {
     EncryptPressed,
     DecryptPressed,
     ProgressUpdated(u8),
+    SelectSource,
+    SelectBackupDir,
     // Commented out as it is not used
     OperationFinished(Result<(), String>),
 }
@@ -73,12 +76,25 @@ impl Application for BackupApp {
                             self.source.clone(),
                             self.backup_dir.clone(),
                             self.password.clone(),
+                            |progress| {
+                                Message::ProgressUpdated(progress as u8);
+                            },
                         ),
                         |result| match result {
                             Ok(_) => Message::OperationFinished(Ok(())),
                             Err(e) => Message::OperationFinished(Err(e)),
                         },
                     );
+                }
+            }
+            Message::SelectSource => {
+                if let Some(path) = FileDialog::new().pick_file() {
+                    self.source = path.display().to_string();
+                }
+            }
+            Message::SelectBackupDir => {
+                if let Some(path) = FileDialog::new().pick_folder() {
+                    self.backup_dir = path.display().to_string();
                 }
             }
             Message::DecryptPressed => {
@@ -120,16 +136,17 @@ impl Application for BackupApp {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let source_input = TextInput::new("Source file or directory", &self.source)
-            .on_input(Message::SourceChanged)
+        let source_input = Button::new(Text::new("Select Source"))
             .padding(10)
-            .size(20);
+            .on_press(Message::SelectSource);
 
-        let backup_dir_input = TextInput::new("Backup directory or output", &self.backup_dir)
-            .on_input(Message::BackupDirChanged)
+        let backup_dir_input = Button::new(Text::new("Select Backup Directory"))
             .padding(10)
-            .size(20)
-            .password();
+            .on_press(Message::SelectBackupDir);
+
+        let progress_bar: ProgressBar<iced::Renderer> = ProgressBar::new(0.0..=1.0, self.progress);
+
+        let save_location = Text::new(&self.status_message).size(16);
 
         let password_input = TextInput::new("Password", &self.password)
             .on_input(Message::PasswordChanged)
@@ -156,7 +173,7 @@ impl Application for BackupApp {
             .push(encrypt_button)
             .push(decrypt_button)
             .push(progress_bar)
-            .push(Text::new(&self.status_message));
+            .push(save_location);
 
         Container::new(content)
             .width(Length::Fill)
@@ -172,15 +189,11 @@ async fn encryption_task(
     _source: String,
     _backup_dir: String,
     _password: String,
+    progress_callback: impl Fn(f32) + Send + 'static,
 ) -> Result<(), String> {
-    // Simulate encryption and progress for demo
     for i in 0..=100 {
-        let _ = iced::futures::future::ready(()).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Emit progress messages to the GUI
-        iced::futures::executor::block_on(async {
-            Message::ProgressUpdated(i);
-        });
+        progress_callback(i as f32 / 100.0);
     }
     Ok(())
 }
@@ -197,7 +210,7 @@ async fn decryption_task(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         // Emit progress messages to the GUI
         iced::futures::executor::block_on(async {
-            Message::ProgressUpdated(i);
+            Message::ProgressUpdated(i as u8);
         });
     }
     Ok(())

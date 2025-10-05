@@ -17,3 +17,4 @@ hmac = "0.12"
 iced = { version = "0.10", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 iced_native = "0.10.3"
+rfd = "0.15.4"
