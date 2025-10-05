@@ -88,14 +88,20 @@ impl Application for BackupApp {
                 }
             }
             Message::SelectSource => {
-                if let Some(path) = FileDialog::new().pick_file() {
-                    self.source = path.display().to_string();
-                }
+                return Command::perform(async { FileDialog::new().pick_file() }, |result| {
+                    match result {
+                        Some(path) => Message::SourceChanged(path.to_string_lossy().to_string()),
+                        None => Message::SourceChanged(String::new()),
+                    }
+                });
             }
             Message::SelectBackupDir => {
-                if let Some(path) = FileDialog::new().pick_folder() {
-                    self.backup_dir = path.display().to_string();
-                }
+                return Command::perform(async { FileDialog::new().pick_folder() }, |result| {
+                    match result {
+                        Some(path) => Message::BackupDirChanged(path.to_string_lossy().to_string()),
+                        None => Message::BackupDirChanged(String::new()),
+                    }
+                });
             }
             Message::DecryptPressed => {
                 if !self.running {
