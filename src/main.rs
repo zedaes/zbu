@@ -10,7 +10,8 @@ enum Message {
     PasswordChanged(String),
     EncryptPressed,
     DecryptPressed,
- // Commented out as it is not used
+    ProgressUpdated(u8),
+    // Commented out as it is not used
     OperationFinished(Result<(), String>),
 }
 
@@ -99,7 +100,12 @@ impl Application for BackupApp {
                 }
             }
             Message::ProgressUpdated(p) => {
-                self.progress = p;
+                println!(
+                    "Debug: p (u8) = {}, self.progress (before) = {}",
+                    p, self.progress
+                );
+                self.progress = p as f32;
+                println!("Debug: self.progress (after) = {}", self.progress);
             }
             Message::OperationFinished(result) => {
                 self.running = false;
@@ -113,7 +119,7 @@ impl Application for BackupApp {
         Command::none()
     }
 
-    fn view(&self) -> Element<'_, '_, Message> {
+    fn view(&self) -> Element<'_, Message> {
         let source_input = TextInput::new("Source file or directory", &self.source)
             .on_input(Message::SourceChanged)
             .padding(10)
@@ -168,10 +174,13 @@ async fn encryption_task(
     _password: String,
 ) -> Result<(), String> {
     // Simulate encryption and progress for demo
-    for _i in 0..=100 {
+    for i in 0..=100 {
         let _ = iced::futures::future::ready(()).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Here you’d emit progress messages to the GUI
+        // Emit progress messages to the GUI
+        iced::futures::executor::block_on(async {
+            Message::ProgressUpdated(i);
+        });
     }
     Ok(())
 }
@@ -183,10 +192,13 @@ async fn decryption_task(
     _password: String,
 ) -> Result<(), String> {
     // Simulate decryption and progress for demo
-    for _i in 0..=100 {
+    for i in 0..=100 {
         let _ = iced::futures::future::ready(()).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Here you’d emit progress messages to the GUI
+        // Emit progress messages to the GUI
+        iced::futures::executor::block_on(async {
+            Message::ProgressUpdated(i);
+        });
     }
     Ok(())
 }
