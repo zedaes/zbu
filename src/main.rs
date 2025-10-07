@@ -14,7 +14,6 @@ enum Message {
     ProgressUpdated(u8),
     SelectSource,
     SelectBackupDir,
-    // Commented out as it is not used
     OperationFinished(Result<(), String>),
 }
 
@@ -58,7 +57,7 @@ impl Application for BackupApp {
     }
 
     fn title(&self) -> String {
-        String::from("ZBU Backup Tool")
+        String::from("zbu")
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -190,7 +189,6 @@ impl Application for BackupApp {
     }
 }
 
-// Dummy async encryption function - replace with actual encrypt logic and progress reporting
 async fn encryption_task(
     _source: String,
     _backup_dir: String,
@@ -204,17 +202,14 @@ async fn encryption_task(
     Ok(())
 }
 
-// Dummy async decryption function - replace with actual decrypt logic and progress reporting
 async fn decryption_task(
     _backup_file: String,
     _output_dir: String,
     _password: String,
 ) -> Result<(), String> {
-    // Simulate decryption and progress for demo
     for i in 0..=100 {
         let _ = iced::futures::future::ready(()).await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // Emit progress messages to the GUI
         iced::futures::executor::block_on(async {
             Message::ProgressUpdated(i as u8);
         });
