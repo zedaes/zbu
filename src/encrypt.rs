@@ -11,7 +11,7 @@ use tar;
 use zstd::bulk::compress;
 
 const PBKDF2_ITERATIONS: u32 = 100_000;
-const KEY_LENGTH: usize = 32; // 256-bit AES key
+const KEY_LENGTH: usize = 32;
 
 type HmacSha256 = Hmac<Sha256>;
 
