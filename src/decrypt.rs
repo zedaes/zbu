@@ -1,5 +1,5 @@
 use hmac::Hmac;
-use openssl::symm::{decrypt, Cipher};
+use openssl::symm::{decrypt_aead, Cipher};
 use pbkdf2::pbkdf2;
 use sha2::Sha256;
 use std::fs;
@@ -13,6 +13,7 @@ const PBKDF2_ITERATIONS: u32 = 600_000;
 const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
+const TAG_LENGTH: usize = 16;
 const MAX_DECOMPRESSED_SIZE: usize = 100_000_000;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -50,7 +51,7 @@ pub fn run_decrypt(
     let mut encrypted_data = Vec::new();
     file.read_to_end(&mut encrypted_data)?;
 
-    let min_size = SALT_LENGTH + NONCE_LENGTH;
+    let min_size = SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH;
     if encrypted_data.len() < min_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -63,12 +64,13 @@ pub fn run_decrypt(
 
     let salt = &encrypted_data[..SALT_LENGTH];
     let nonce = &encrypted_data[SALT_LENGTH..SALT_LENGTH + NONCE_LENGTH];
-    let ciphertext = &encrypted_data[SALT_LENGTH + NONCE_LENGTH..];
+    let tag = &encrypted_data[SALT_LENGTH + NONCE_LENGTH..SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH];
+    let ciphertext = &encrypted_data[SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH..];
 
     let key = derive_key(password, salt);
 
     println!("Decrypting data...");
-    let decrypted_data = decrypt(Cipher::aes_256_gcm(), &key, Some(nonce), ciphertext).map_err(
+    let decrypted_data = decrypt_aead(Cipher::aes_256_gcm(), &key, Some(nonce), &[], ciphertext, tag).map_err(
         |e| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,

@@ -1,3 +1,4 @@
+use clap::{Parser, Subcommand};
 use iced::widget::{Button, Column, Container, ProgressBar, Row, Text, TextInput};
 use iced::{Application, Command, Element, Length, Theme};
 use rfd::FileDialog;
@@ -8,6 +9,38 @@ mod encrypt;
 
 use decrypt::run_decrypt;
 use encrypt::run_encrypt;
+
+#[derive(Parser)]
+#[command(name = "zbu")]
+#[command(about = "A secure backup utility with encryption", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Encrypt {
+        #[arg(short, long, help = "Source file or directory to backup")]
+        source: String,
+        
+        #[arg(short, long, help = "Directory to save the encrypted backup")]
+        backup_dir: String,
+        
+        #[arg(short, long, help = "Password for encryption")]
+        password: String,
+    },
+    Decrypt {
+        #[arg(short, long, help = "Backup file to decrypt")]
+        backup_file: String,
+        
+        #[arg(short, long, help = "Output directory for restored files")]
+        output_dir: String,
+        
+        #[arg(short, long, help = "Password for decryption")]
+        password: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -402,14 +435,33 @@ async fn decryption_task(
     .map_err(|e| format!("Task execution error: {}", e))?
 }
 
-fn main() -> iced::Result {
-    BackupApp::run(iced::Settings {
-        window: iced::window::Settings {
-            size: (700, 700),
-            resizable: true,
-            decorations: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    })
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Encrypt { source, backup_dir, password }) => {
+            println!("Starting encryption...");
+            run_encrypt(&source, &backup_dir, &password)?;
+            println!("Encryption completed successfully!");
+            Ok(())
+        }
+        Some(Commands::Decrypt { backup_file, output_dir, password }) => {
+            println!("Starting decryption...");
+            run_decrypt(&backup_file, &output_dir, &password)?;
+            println!("Decryption completed successfully!");
+            Ok(())
+        }
+        None => {
+            BackupApp::run(iced::Settings {
+                window: iced::window::Settings {
+                    size: (700, 700),
+                    resizable: true,
+                    decorations: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })?;
+            Ok(())
+        }
+    }
 }

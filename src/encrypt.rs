@@ -1,6 +1,6 @@
 use chrono::Local;
 use hmac::Hmac;
-use openssl::symm::{encrypt, Cipher};
+use openssl::symm::{encrypt_aead, Cipher};
 use pbkdf2::pbkdf2;
 use rand::RngCore;
 use sha2::Sha256;
@@ -14,6 +14,7 @@ const PBKDF2_ITERATIONS: u32 = 600_000;
 const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
+const TAG_LENGTH: usize = 16;
 const COMPRESSION_LEVEL: i32 = 19;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -114,12 +115,14 @@ fn encrypt_data_with_password(data: &[u8], password: &str) -> io::Result<Vec<u8>
     let mut nonce = [0u8; NONCE_LENGTH];
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    let ciphertext = encrypt(cipher, &key, Some(&nonce), data)
+    let mut tag = vec![0u8; TAG_LENGTH];
+    let ciphertext = encrypt_aead(cipher, &key, Some(&nonce), &[], data, &mut tag)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption error: {:?}", e)))?;
 
-    let mut encrypted_blob = Vec::with_capacity(salt.len() + nonce.len() + ciphertext.len());
+    let mut encrypted_blob = Vec::with_capacity(salt.len() + nonce.len() + tag.len() + ciphertext.len());
     encrypted_blob.extend_from_slice(&salt);
     encrypted_blob.extend_from_slice(&nonce);
+    encrypted_blob.extend_from_slice(&tag);
     encrypted_blob.extend_from_slice(&ciphertext);
 
     Ok(encrypted_blob)
