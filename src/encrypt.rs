@@ -10,8 +10,11 @@ use std::path::Path;
 use tar;
 use zstd::bulk::compress;
 
-const PBKDF2_ITERATIONS: u32 = 100_000;
+const PBKDF2_ITERATIONS: u32 = 600_000;
 const KEY_LENGTH: usize = 32;
+const SALT_LENGTH: usize = 16;
+const NONCE_LENGTH: usize = 12;
+const COMPRESSION_LEVEL: i32 = 19;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -28,35 +31,56 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
     if !source.exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "Source path does not exist",
+            format!("Source path does not exist: {}", source_path),
         ));
     }
+    
+    if password.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Password must be at least 8 characters long",
+        ));
+    }
+
     if !backup_dir.exists() {
         fs::create_dir_all(backup_dir)?;
     }
 
-    let timestamp = Local::now().format("%Y%m%d%H%M%S").to_string();
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
 
+    println!("Creating archive...");
     let tar_data = create_tarball(source)?;
-    let compressed_data = compress(&tar_data, 22)
+    
+    println!("Compressing data...");
+    let original_size = tar_data.len();
+    let compressed_data = compress(&tar_data, COMPRESSION_LEVEL)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Compression error: {:?}", e)))?;
 
+    let compressed_size = compressed_data.len();
+    if compressed_size > 0 && original_size > 0 {
+        let ratio = (compressed_size as f64 / original_size as f64) * 100.0;
+        println!("Compressed to {:.1}% of original size", ratio);
+    }
+
+    println!("Encrypting data...");
     let encrypted_data = encrypt_data_with_password(&compressed_data, password)?;
 
-    let backup_file_name = format!(
-        "{}_{}.backup",
-        source.file_name().unwrap().to_string_lossy(),
-        timestamp
-    );
-
+    let source_name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "backup".to_string());
+    
+    let backup_file_name = format!("{}_{}.backup", source_name, timestamp);
     let backup_path = backup_dir.join(backup_file_name);
+
+    println!("Writing backup file...");
     let mut file = fs::File::create(&backup_path)?;
     file.write_all(&encrypted_data)?;
 
-    println!(
-        "Encrypted & compressed backup created: {}",
-        backup_path.display()
-    );
+    println!("Backup created successfully: {}", backup_path.display());
+    println!("   Original size: {} bytes", tar_data.len());
+    println!("   Compressed size: {} bytes", compressed_data.len());
+    println!("   Encrypted size: {} bytes", encrypted_data.len());
 
     Ok(())
 }
@@ -81,19 +105,18 @@ fn create_tarball(source: &Path) -> io::Result<Vec<u8>> {
 }
 
 fn encrypt_data_with_password(data: &[u8], password: &str) -> io::Result<Vec<u8>> {
-    let mut salt = [0u8; 16];
+    let mut salt = [0u8; SALT_LENGTH];
     rand::thread_rng().fill_bytes(&mut salt);
 
     let key = derive_key(password, &salt);
 
     let cipher = Cipher::aes_256_gcm();
-    let mut nonce = [0u8; 12];
+    let mut nonce = [0u8; NONCE_LENGTH];
     rand::thread_rng().fill_bytes(&mut nonce);
 
     let ciphertext = encrypt(cipher, &key, Some(&nonce), data)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Encryption error: {:?}", e)))?;
 
-    // Store salt + nonce + ciphertext
     let mut encrypted_blob = Vec::with_capacity(salt.len() + nonce.len() + ciphertext.len());
     encrypted_blob.extend_from_slice(&salt);
     encrypted_blob.extend_from_slice(&nonce);

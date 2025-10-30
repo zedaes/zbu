@@ -1,1 +1,21 @@
+# Rust
 /target
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Backup files (don't commit actual backups!)
+*.backup
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes

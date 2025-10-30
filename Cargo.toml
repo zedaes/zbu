@@ -1,7 +1,13 @@
 [package]
 name = "zbu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A secure backup utility with AES-256-GCM encryption and Zstandard compression"
+license = "MIT"
+repository = "https://github.com/yourusername/zbu"
+keywords = ["backup", "encryption", "security", "compression", "gui"]
+categories = ["command-line-utilities", "cryptography", "compression"]
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
@@ -18,3 +24,12 @@ iced = { version = "0.10", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 iced_native = "0.10.3"
 rfd = "0.15.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1

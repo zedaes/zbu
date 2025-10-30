@@ -1,39 +1,48 @@
-use iced::widget::{button, text_input, Button, Column, Container, ProgressBar, Text, TextInput};
-use iced::{theme, Alignment, Application, Command, Element, Length};
+use iced::widget::{Button, Column, Container, ProgressBar, Row, Text, TextInput};
+use iced::{Application, Command, Element, Length, Theme};
 use rfd::FileDialog;
+use std::path::PathBuf;
 
-use iced::executor;
+mod decrypt;
+mod encrypt;
+
+use decrypt::run_decrypt;
+use encrypt::run_encrypt;
 
 #[derive(Debug, Clone)]
 enum Message {
     SourceChanged(String),
     BackupDirChanged(String),
     PasswordChanged(String),
+    ConfirmPasswordChanged(String),
     EncryptPressed,
     DecryptPressed,
-    ProgressUpdated(u8),
     SelectSource,
     SelectBackupDir,
-    OperationFinished(Result<(), String>),
+    OperationFinished(Result<String, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OperationMode {
+    Encrypt,
+    Decrypt,
 }
 
 struct BackupApp {
     source: String,
     backup_dir: String,
     password: String,
-    _encrypt_button: button::State,
-    _decrypt_button: button::State,
-    _source_input: text_input::State,
-    _backup_dir_input: text_input::State,
-    _password_input: text_input::State,
+    confirm_password: String,
     progress: f32,
     running: bool,
     status_message: String,
+    is_error: bool,
+    mode: OperationMode,
 }
 
 impl Application for BackupApp {
-    type Theme = iced::theme::Theme;
-    type Executor = executor::Default;
+    type Theme = Theme;
+    type Executor = iced::executor::Default;
     type Message = Message;
     type Flags = ();
 
@@ -43,96 +52,158 @@ impl Application for BackupApp {
                 source: String::new(),
                 backup_dir: String::new(),
                 password: String::new(),
-                _encrypt_button: button::State::new(),
-                _decrypt_button: button::State::new(),
-                _source_input: text_input::State::new(),
-                _backup_dir_input: text_input::State::new(),
-                _password_input: text_input::State::new(),
+                confirm_password: String::new(),
                 progress: 0.0,
                 running: false,
                 status_message: String::new(),
+                is_error: false,
+                mode: OperationMode::Encrypt,
             },
             Command::none(),
         )
     }
 
     fn title(&self) -> String {
-        String::from("zbu")
+        String::from("ZBU")
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
-            Message::SourceChanged(val) => self.source = val,
-            Message::BackupDirChanged(val) => self.backup_dir = val,
-            Message::PasswordChanged(val) => self.password = val,
+            Message::SourceChanged(val) => {
+                self.source = val;
+                self.is_error = false;
+            }
+            Message::BackupDirChanged(val) => {
+                self.backup_dir = val;
+                self.is_error = false;
+            }
+            Message::PasswordChanged(val) => {
+                self.password = val;
+                self.is_error = false;
+            }
+            Message::ConfirmPasswordChanged(val) => {
+                self.confirm_password = val;
+                self.is_error = false;
+            }
             Message::EncryptPressed => {
                 if !self.running {
+                    if self.source.is_empty() {
+                        self.status_message = "Please select a source file or folder".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+                    if self.backup_dir.is_empty() {
+                        self.status_message = "Please select a backup directory".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+                    if self.password.is_empty() {
+                        self.status_message = "Please enter a password".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+                    if self.password.len() < 8 {
+                        self.status_message = "Password must be at least 8 characters".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+                    if self.password != self.confirm_password {
+                        self.status_message = "Passwords do not match".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+
                     self.progress = 0.0;
                     self.running = true;
-                    self.status_message = "Encrypting...".into();
+                    self.mode = OperationMode::Encrypt;
+                    self.status_message = "Encrypting and backing up...".into();
+                    self.is_error = false;
+
+                    let source = self.source.clone();
+                    let backup_dir = self.backup_dir.clone();
+                    let password = self.password.clone();
+
                     return Command::perform(
-                        encryption_task(
-                            self.source.clone(),
-                            self.backup_dir.clone(),
-                            self.password.clone(),
-                            |progress| {
-                                Message::ProgressUpdated(progress as u8);
-                            },
-                        ),
-                        |result| match result {
-                            Ok(_) => Message::OperationFinished(Ok(())),
-                            Err(e) => Message::OperationFinished(Err(e)),
-                        },
+                        async move { encryption_task(source, backup_dir, password).await },
+                        Message::OperationFinished,
                     );
                 }
             }
             Message::SelectSource => {
-                return Command::perform(async { FileDialog::new().pick_file() }, |result| {
-                    match result {
+                let mode = self.mode;
+                return Command::perform(
+                    async move {
+                        if mode == OperationMode::Encrypt {
+                            if let Some(path) = FileDialog::new().pick_folder() {
+                                return Some(path);
+                            }
+                            FileDialog::new().pick_file()
+                        } else {
+                            FileDialog::new()
+                                .add_filter("Backup Files", &["backup"])
+                                .pick_file()
+                        }
+                    },
+                    |result| match result {
                         Some(path) => Message::SourceChanged(path.to_string_lossy().to_string()),
                         None => Message::SourceChanged(String::new()),
-                    }
-                });
+                    },
+                );
             }
             Message::SelectBackupDir => {
-                return Command::perform(async { FileDialog::new().pick_folder() }, |result| {
-                    match result {
+                return Command::perform(
+                    async { FileDialog::new().pick_folder() },
+                    |result| match result {
                         Some(path) => Message::BackupDirChanged(path.to_string_lossy().to_string()),
                         None => Message::BackupDirChanged(String::new()),
-                    }
-                });
+                    },
+                );
             }
             Message::DecryptPressed => {
                 if !self.running {
+                    if self.source.is_empty() {
+                        self.status_message = "Please select a backup file to decrypt".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+                    if self.backup_dir.is_empty() {
+                        self.status_message = "Please select an output directory".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+                    if self.password.is_empty() {
+                        self.status_message = "Please enter the password".into();
+                        self.is_error = true;
+                        return Command::none();
+                    }
+
                     self.progress = 0.0;
                     self.running = true;
-                    self.status_message = "Decrypting...".into();
+                    self.mode = OperationMode::Decrypt;
+                    self.status_message = "Decrypting and restoring...".into();
+                    self.is_error = false;
+
+                    let source = self.source.clone();
+                    let backup_dir = self.backup_dir.clone();
+                    let password = self.password.clone();
+
                     return Command::perform(
-                        decryption_task(
-                            self.source.clone(),
-                            self.backup_dir.clone(),
-                            self.password.clone(),
-                        ),
-                        |result| match result {
-                            Ok(_) => Message::OperationFinished(Ok(())),
-                            Err(e) => Message::OperationFinished(Err(e)),
-                        },
+                        async move { decryption_task(source, backup_dir, password).await },
+                        Message::OperationFinished,
                     );
                 }
-            }
-            Message::ProgressUpdated(p) => {
-                println!(
-                    "Debug: p (u8) = {}, self.progress (before) = {}",
-                    p, self.progress
-                );
-                self.progress = p as f32;
-                println!("Debug: self.progress (after) = {}", self.progress);
             }
             Message::OperationFinished(result) => {
                 self.running = false;
                 match result {
-                    Ok(_) => self.status_message = "Operation completed successfully.".into(),
-                    Err(e) => self.status_message = format!("Error: {}", e),
+                    Ok(msg) => {
+                        self.status_message = msg;
+                        self.is_error = false;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Error: {}", e);
+                        self.is_error = true;
+                    }
                 }
                 self.progress = 0.0;
             }
@@ -141,44 +212,158 @@ impl Application for BackupApp {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let source_input = Button::new(Text::new("Select Source"))
-            .padding(10)
-            .on_press(Message::SelectSource);
+        let title = Text::new("ZBU - Secure Backup Utility")
+            .size(32)
+            .style(iced::theme::Text::Color(iced::Color::from_rgb(0.2, 0.4, 0.8)));
 
-        let backup_dir_input = Button::new(Text::new("Select Backup Directory"))
-            .padding(10)
-            .on_press(Message::SelectBackupDir);
+        let source_label = Text::new(if self.mode == OperationMode::Encrypt {
+            "Source (File/Folder):"
+        } else {
+            "Backup File:"
+        })
+        .size(16);
 
-        let progress_bar: ProgressBar<iced::Renderer> = ProgressBar::new(0.0..=1.0, self.progress);
+        let source_display = Text::new(if self.source.is_empty() {
+            "No source selected".to_string()
+        } else {
+            PathBuf::from(&self.source)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| self.source.clone())
+        })
+        .size(14)
+        .style(iced::theme::Text::Color(iced::Color::from_rgb(0.4, 0.4, 0.4)));
 
-        let save_location = Text::new(&self.status_message).size(16);
+        let source_button = Button::new(
+            Text::new("Select Source")
+                .horizontal_alignment(iced::alignment::Horizontal::Center),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .on_press_maybe(if !self.running {
+            Some(Message::SelectSource)
+        } else {
+            None
+        });
 
-        let password_input = TextInput::new("Password", &self.password)
+        let backup_label = Text::new(if self.mode == OperationMode::Encrypt {
+            "Backup Directory:"
+        } else {
+            "Output Directory:"
+        })
+        .size(16);
+
+        let backup_display = Text::new(if self.backup_dir.is_empty() {
+            "No directory selected".to_string()
+        } else {
+            PathBuf::from(&self.backup_dir)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| self.backup_dir.clone())
+        })
+        .size(14)
+        .style(iced::theme::Text::Color(iced::Color::from_rgb(0.4, 0.4, 0.4)));
+
+        let backup_button = Button::new(
+            Text::new("Select Directory")
+                .horizontal_alignment(iced::alignment::Horizontal::Center),
+        )
+        .padding(12)
+        .width(Length::Fill)
+        .on_press_maybe(if !self.running {
+            Some(Message::SelectBackupDir)
+        } else {
+            None
+        });
+
+        let password_input = TextInput::new("Enter password", &self.password)
             .on_input(Message::PasswordChanged)
-            .padding(10)
-            .size(20);
+            .padding(12)
+            .size(16)
+            .password()
+            .width(Length::Fill);
 
-        let encrypt_button = Button::new(Text::new("Encrypt"))
-            .padding(10)
-            .on_press(Message::EncryptPressed);
+        let confirm_password_input = TextInput::new("Confirm password", &self.confirm_password)
+            .on_input(Message::ConfirmPasswordChanged)
+            .padding(12)
+            .size(16)
+            .password()
+            .width(Length::Fill);
 
-        let decrypt_button = Button::new(Text::new("Decrypt"))
-            .padding(10)
-            .on_press(Message::DecryptPressed);
+        let password_section = if self.mode == OperationMode::Encrypt {
+            Column::new()
+                .spacing(8)
+                .push(Text::new("Password:").size(16))
+                .push(password_input)
+                .push(confirm_password_input)
+        } else {
+            Column::new()
+                .spacing(8)
+                .push(Text::new("Password:").size(16))
+                .push(password_input)
+        };
 
-        let progress_bar = ProgressBar::new(0.0..=1.0, self.progress);
+        let encrypt_button = Button::new(
+            Text::new("Encrypt & Backup")
+                .horizontal_alignment(iced::alignment::Horizontal::Center),
+        )
+        .padding(15)
+        .width(Length::Fill)
+        .style(iced::theme::Button::Primary)
+        .on_press_maybe(if !self.running {
+            Some(Message::EncryptPressed)
+        } else {
+            None
+        });
 
-        let content = Column::new()
-            .padding(20)
-            .align_items(Alignment::Center)
-            .spacing(10)
-            .push(source_input)
-            .push(backup_dir_input)
-            .push(password_input)
+        let decrypt_button = Button::new(
+            Text::new("Decrypt & Restore")
+                .horizontal_alignment(iced::alignment::Horizontal::Center),
+        )
+        .padding(15)
+        .width(Length::Fill)
+        .style(iced::theme::Button::Secondary)
+        .on_press_maybe(if !self.running {
+            Some(Message::DecryptPressed)
+        } else {
+            None
+        });
+
+        let button_row = Row::new()
+            .spacing(15)
             .push(encrypt_button)
-            .push(decrypt_button)
-            .push(progress_bar)
-            .push(save_location);
+            .push(decrypt_button);
+
+        let mut content = Column::new()
+            .padding(30)
+            .spacing(20)
+            .max_width(600)
+            .push(title)
+            .push(source_label)
+            .push(source_display)
+            .push(source_button)
+            .push(backup_label)
+            .push(backup_display)
+            .push(backup_button)
+            .push(password_section)
+            .push(button_row);
+
+        if self.running {
+            let progress_bar = ProgressBar::new(0.0..=1.0, self.progress);
+            content = content.push(progress_bar);
+        }
+
+        if !self.status_message.is_empty() {
+            let status_color = if self.is_error {
+                iced::Color::from_rgb(0.8, 0.2, 0.2)
+            } else {
+                iced::Color::from_rgb(0.2, 0.6, 0.3)
+            };
+            let status = Text::new(&self.status_message)
+                .size(16)
+                .style(iced::theme::Text::Color(status_color));
+            content = content.push(status);
+        }
 
         Container::new(content)
             .width(Length::Fill)
@@ -190,33 +375,41 @@ impl Application for BackupApp {
 }
 
 async fn encryption_task(
-    _source: String,
-    _backup_dir: String,
-    _password: String,
-    progress_callback: impl Fn(f32) + Send + 'static,
-) -> Result<(), String> {
-    for i in 0..=100 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        progress_callback(i as f32 / 100.0);
-    }
-    Ok(())
+    source: String,
+    backup_dir: String,
+    password: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        run_encrypt(&source, &backup_dir, &password)
+            .map(|_| format!("Successfully encrypted backup saved to: {}", backup_dir))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
 }
 
 async fn decryption_task(
-    _backup_file: String,
-    _output_dir: String,
-    _password: String,
-) -> Result<(), String> {
-    for i in 0..=100 {
-        let _ = iced::futures::future::ready(()).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        iced::futures::executor::block_on(async {
-            Message::ProgressUpdated(i as u8);
-        });
-    }
-    Ok(())
+    backup_file: String,
+    output_dir: String,
+    password: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        run_decrypt(&backup_file, &output_dir, &password)
+            .map(|_| format!("Successfully restored backup to: {}", output_dir))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Task execution error: {}", e))?
 }
 
 fn main() -> iced::Result {
-    BackupApp::run(iced::Settings::default())
+    BackupApp::run(iced::Settings {
+        window: iced::window::Settings {
+            size: (700, 700),
+            resizable: true,
+            decorations: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
