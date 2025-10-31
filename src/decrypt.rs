@@ -9,12 +9,12 @@ use std::path::Path;
 use tar;
 use zstd::bulk::decompress;
 
-const PBKDF2_ITERATIONS: u32 = 600_000;
+const PBKDF2_ITERATIONS: u32 = 100_000;
 const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
-const MAX_DECOMPRESSED_SIZE: usize = 100_000_000;
+const MAX_DECOMPRESSED_SIZE: usize = 50_000_000;
 
 type HmacSha256 = Hmac<Sha256>;
 

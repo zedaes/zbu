@@ -1,14 +1,17 @@
 use clap::{Parser, Subcommand};
-use iced::widget::{Button, Column, Container, ProgressBar, Row, Text, TextInput};
-use iced::{Application, Command, Element, Length, Theme};
-use rfd::FileDialog;
-use std::path::PathBuf;
 
 mod decrypt;
 mod encrypt;
 
 use decrypt::run_decrypt;
 use encrypt::run_encrypt;
+
+#[cfg(feature = "gui")]
+use iced::widget::{Button, Column, Container, Row, Text, TextInput};
+#[cfg(feature = "gui")]
+use iced::{Application, Command, Element, Length, Theme};
+#[cfg(feature = "gui")]
+use rfd::FileDialog;
 
 #[derive(Parser)]
 #[command(name = "zbu")]
@@ -42,6 +45,7 @@ enum Commands {
     },
 }
 
+#[cfg(feature = "gui")]
 #[derive(Debug, Clone)]
 enum Message {
     SourceChanged(String),
@@ -55,24 +59,26 @@ enum Message {
     OperationFinished(Result<String, String>),
 }
 
+#[cfg(feature = "gui")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum OperationMode {
     Encrypt,
     Decrypt,
 }
 
+#[cfg(feature = "gui")]
 struct BackupApp {
     source: String,
     backup_dir: String,
     password: String,
     confirm_password: String,
-    progress: f32,
     running: bool,
     status_message: String,
     is_error: bool,
     mode: OperationMode,
 }
 
+#[cfg(feature = "gui")]
 impl Application for BackupApp {
     type Theme = Theme;
     type Executor = iced::executor::Default;
@@ -86,7 +92,6 @@ impl Application for BackupApp {
                 backup_dir: String::new(),
                 password: String::new(),
                 confirm_password: String::new(),
-                progress: 0.0,
                 running: false,
                 status_message: String::new(),
                 is_error: false,
@@ -146,7 +151,6 @@ impl Application for BackupApp {
                         return Command::none();
                     }
 
-                    self.progress = 0.0;
                     self.running = true;
                     self.mode = OperationMode::Encrypt;
                     self.status_message = "Encrypting and backing up...".into();
@@ -210,7 +214,6 @@ impl Application for BackupApp {
                         return Command::none();
                     }
 
-                    self.progress = 0.0;
                     self.running = true;
                     self.mode = OperationMode::Decrypt;
                     self.status_message = "Decrypting and restoring...".into();
@@ -238,7 +241,6 @@ impl Application for BackupApp {
                         self.is_error = true;
                     }
                 }
-                self.progress = 0.0;
             }
         }
         Command::none()
@@ -381,11 +383,6 @@ impl Application for BackupApp {
             .push(password_section)
             .push(button_row);
 
-        if self.running {
-            let progress_bar = ProgressBar::new(0.0..=1.0, self.progress);
-            content = content.push(progress_bar);
-        }
-
         if !self.status_message.is_empty() {
             let status_color = if self.is_error {
                 iced::Color::from_rgb(0.8, 0.2, 0.2)
@@ -407,6 +404,7 @@ impl Application for BackupApp {
     }
 }
 
+#[cfg(feature = "gui")]
 async fn encryption_task(
     source: String,
     backup_dir: String,
@@ -421,6 +419,7 @@ async fn encryption_task(
     .map_err(|e| format!("Task execution error: {}", e))?
 }
 
+#[cfg(feature = "gui")]
 async fn decryption_task(
     backup_file: String,
     output_dir: String,
@@ -452,16 +451,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         None => {
-            BackupApp::run(iced::Settings {
-                window: iced::window::Settings {
-                    size: (700, 700),
-                    resizable: true,
-                    decorations: true,
+            #[cfg(feature = "gui")]
+            {
+                BackupApp::run(iced::Settings {
+                    window: iced::window::Settings {
+                        size: (500, 600),
+                        resizable: false,
+                        decorations: true,
+                        ..Default::default()
+                    },
+                    antialiasing: false,
                     ..Default::default()
-                },
-                ..Default::default()
-            })?;
-            Ok(())
+                })?;
+                Ok(())
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                eprintln!("GUI feature not enabled. Use --help to see CLI options.");
+                eprintln!("To use GUI, rebuild with: cargo build --features gui");
+                std::process::exit(1);
+            }
         }
     }
 }
