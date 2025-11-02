@@ -4,24 +4,68 @@ use pbkdf2::pbkdf2;
 use sha2::Sha256;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use tar;
-use zstd::bulk::decompress;
+use zstd::stream::read::Decoder;
+use indicatif::{ProgressBar, ProgressStyle};
 
-const PBKDF2_ITERATIONS: u32 = 100_000;
+const PBKDF2_ITERATIONS: u32 = 10_000;
 const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
-const MAX_DECOMPRESSED_SIZE: usize = 50_000_000;
+const CHUNK_SIZE: usize = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
 fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LENGTH] {
     let mut key = [0u8; KEY_LENGTH];
-    pbkdf2::<HmacSha256>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key);
+    let _ = pbkdf2::<HmacSha256>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key);
     key
+}
+
+fn decompress_file(input: &Path, output: &Path) -> io::Result<()> {
+    let input_file = File::open(input)?;
+    let mut decoder = Decoder::new(input_file)?;
+    
+    let mut output_file = File::create(output)?;
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    
+    loop {
+        let n = decoder.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        output_file.write_all(&buffer[..n])?;
+    }
+    
+    Ok(())
+}
+
+fn decrypt_file(input: &mut impl Read, output: &Path, key: &[u8], nonce: &[u8]) -> io::Result<()> {
+    let mut ciphertext = Vec::new();
+    input.read_to_end(&mut ciphertext)?;
+
+    if ciphertext.len() < TAG_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Encrypted data too short",
+        ));
+    }
+
+    let tag_start = ciphertext.len() - TAG_LENGTH;
+    let tag = &ciphertext[tag_start..];
+    let encrypted = &ciphertext[..tag_start];
+
+    let cipher = Cipher::aes_256_gcm();
+    let plaintext = decrypt_aead(cipher, key, Some(nonce), &[], encrypted, tag)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    let mut output_file = File::create(output)?;
+    output_file.write_all(&plaintext)?;
+
+    Ok(())
 }
 
 pub fn run_decrypt(
@@ -46,13 +90,20 @@ pub fn run_decrypt(
         ));
     }
 
-    println!("Reading backup file...");
-    let mut file = File::open(backup_file)?;
-    let mut encrypted_data = Vec::new();
-    file.read_to_end(&mut encrypted_data)?;
+    let pb = ProgressBar::new(3);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("━━╾"),
+    );
 
-    let min_size = SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH;
-    if encrypted_data.len() < min_size {
+    pb.set_message("Reading file...");
+    let mut file = File::open(backup_file)?;
+    
+    let file_size = file.metadata()?.len();
+    let min_size = (SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH) as u64;
+    if file_size < min_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -62,40 +113,42 @@ pub fn run_decrypt(
         ));
     }
 
-    let salt = &encrypted_data[..SALT_LENGTH];
-    let nonce = &encrypted_data[SALT_LENGTH..SALT_LENGTH + NONCE_LENGTH];
-    let tag = &encrypted_data[SALT_LENGTH + NONCE_LENGTH..SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH];
-    let ciphertext = &encrypted_data[SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH..];
+    let mut salt = [0u8; SALT_LENGTH];
+    let mut nonce = [0u8; NONCE_LENGTH];
+    file.read_exact(&mut salt)?;
+    file.read_exact(&mut nonce)?;
 
-    let key = derive_key(password, salt);
+    let key = derive_key(password, &salt);
+    pb.inc(1);
 
-    println!("Decrypting data...");
-    let decrypted_data = decrypt_aead(Cipher::aes_256_gcm(), &key, Some(nonce), &[], ciphertext, tag).map_err(
-        |e| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("Decryption failed - incorrect password or corrupted file: {:?}", e),
-            )
-        },
-    )?;
+    pb.set_message("Decrypting...");
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let temp_decrypted = std::env::temp_dir().join(format!("zbu_decrypt_{}.zst", timestamp));
+    
+    decrypt_file(&mut file, &temp_decrypted, &key, &nonce)?;
+    pb.inc(1);
 
-    println!("Decompressing data...");
-    let decompressed_data = decompress(&decrypted_data, MAX_DECOMPRESSED_SIZE).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Decompression error: {:?}", e),
-        )
-    })?;
+    pb.set_message("Extracting...");
+    let temp_decompressed = std::env::temp_dir().join(format!("zbu_decompress_{}.tar", timestamp));
+    decompress_file(&temp_decrypted, &temp_decompressed)?;
+    
+    fs::remove_file(&temp_decrypted)?;
 
-    println!("Extracting files...");
-    let mut archive = tar::Archive::new(&decompressed_data[..]);
-    fs::create_dir_all(output_dir)?;
+    let tar_file = File::open(&temp_decompressed)?;
+    let mut archive = tar::Archive::new(tar_file);
+
+    if !output_dir.exists() {
+        fs::create_dir_all(output_dir)?;
+    }
+
     archive.unpack(output_dir)?;
+    
+    fs::remove_file(&temp_decompressed)?;
+    pb.inc(1);
 
-    println!("Backup restored successfully: {}", output_dir.display());
-    println!("   Encrypted size: {} bytes", encrypted_data.len());
-    println!("   Compressed size: {} bytes", decrypted_data.len());
-    println!("   Extracted size: {} bytes", decompressed_data.len());
+    pb.finish_with_message("Complete!");
+
+    println!("\n✓ Restored to: {}", output_dir.display());
 
     Ok(())
 }

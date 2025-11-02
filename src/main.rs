@@ -439,15 +439,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Some(Commands::Encrypt { source, backup_dir, password }) => {
-            println!("Starting encryption...");
             run_encrypt(&source, &backup_dir, &password)?;
-            println!("Encryption completed successfully!");
             Ok(())
         }
         Some(Commands::Decrypt { backup_file, output_dir, password }) => {
-            println!("Starting decryption...");
             run_decrypt(&backup_file, &output_dir, &password)?;
-            println!("Decryption completed successfully!");
             Ok(())
         }
         None => {

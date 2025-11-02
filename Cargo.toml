@@ -13,15 +13,16 @@ categories = ["command-line-utilities", "cryptography", "compression"]
 clap = { version = "4.0", features = ["derive"] }
 chrono = "0.4"
 openssl = "0.10"
-rand = "0.8"
+rand = "0.9"
 tar = "0.4"
-zstd = "0.11"
-pbkdf2 = "0.10"
+zstd = "0.13"
+pbkdf2 = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
+indicatif = "0.18"
 
 [dependencies.iced]
-version = "0.10"
+version = "0.13"
 features = ["tokio"]
 optional = true
 
