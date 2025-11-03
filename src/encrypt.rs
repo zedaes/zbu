@@ -6,9 +6,12 @@ use rand::RngCore;
 use sha2::Sha256;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use zstd::stream::write::Encoder;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 const PBKDF2_ITERATIONS: u32 = 10_000;
 const KEY_LENGTH: usize = 32;
@@ -96,17 +99,88 @@ fn compress_file_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::R
 }
 
 fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
-    let output_file = File::create(output)?;
-    let mut encoder = Encoder::new(output_file, COMPRESSION_LEVEL)?;
+    let files = collect_files(source, source)?;
+    let total_size: u64 = files.par_iter()
+        .filter_map(|(path, _)| fs::metadata(path).ok())
+        .map(|m| m.len())
+        .sum();
     
-    let total_size = calculate_dir_size(source);
     pb.set_length(total_size);
     pb.set_position(0);
     
-    compress_dir_contents(&mut encoder, source, source, pb)?;
+    let output_file = File::create(output)?;
+    let mut encoder = Encoder::new(output_file, COMPRESSION_LEVEL)?;
+    
+    let processed = Arc::new(AtomicU64::new(0));
+    
+    let chunks: Vec<Vec<u8>> = files.par_iter()
+        .filter_map(|(path, rel_path)| {
+            compress_file_to_bytes(path, rel_path, &processed, pb).ok()
+        })
+        .collect();
+    
+    for chunk in chunks {
+        encoder.write_all(&chunk)?;
+    }
     
     encoder.finish()?;
     Ok(fs::metadata(output)?.len())
+}
+
+fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
+    
+    if current.is_file() {
+        let rel = current.strip_prefix(base)
+            .unwrap_or(current)
+            .to_string_lossy()
+            .to_string();
+        files.push((current.to_path_buf(), rel));
+        return Ok(files);
+    }
+    
+    for entry in fs::read_dir(current)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        
+        let path = entry.path();
+        
+        if path.is_file() {
+            let rel = path.strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            files.push((path, rel));
+        } else if path.is_dir() {
+            files.extend(collect_files(base, &path)?);
+        }
+    }
+    
+    Ok(files)
+}
+
+fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64>, pb: &ProgressBar) -> io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    
+    buffer.extend_from_slice(format!("FILE:{}\n", rel_path.len()).as_bytes());
+    buffer.extend_from_slice(rel_path.as_bytes());
+    
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let size = metadata.len();
+    
+    buffer.extend_from_slice(&size.to_le_bytes());
+    
+    let mut file_data = Vec::new();
+    file.read_to_end(&mut file_data)?;
+    buffer.extend_from_slice(&file_data);
+    
+    processed.fetch_add(size, Ordering::Relaxed);
+    pb.set_position(processed.load(Ordering::Relaxed));
+    
+    Ok(buffer)
 }
 
 fn calculate_dir_size(dir: &Path) -> u64 {
@@ -124,52 +198,6 @@ fn calculate_dir_size(dir: &Path) -> u64 {
         }
     }
     size
-}
-
-fn compress_dir_contents(encoder: &mut Encoder<File>, base: &Path, current: &Path, pb: &ProgressBar) -> io::Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        
-        let path = entry.path();
-        
-        if path.is_file() {
-            if let Ok(mut file) = File::open(&path) {
-                let relative = path.strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy();
-                
-                encoder.write_all(format!("FILE:{}\n", relative.len()).as_bytes())?;
-                encoder.write_all(relative.as_bytes())?;
-                
-                if let Ok(metadata) = file.metadata() {
-                    let size = metadata.len();
-                    encoder.write_all(&size.to_le_bytes())?;
-                    
-                    let mut buffer = vec![0u8; CHUNK_SIZE];
-                    let mut remaining = size;
-                    while remaining > 0 {
-                        let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
-                        if let Ok(n) = file.read(&mut buffer[..to_read]) {
-                            if n == 0 {
-                                break;
-                            }
-                            encoder.write_all(&buffer[..n])?;
-                            pb.inc(n as u64);
-                            remaining -= n as u64;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-        } else if path.is_dir() {
-            compress_dir_contents(encoder, base, &path, pb)?;
-        }
-    }
-    Ok(())
 }
 
 pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::Result<()> {

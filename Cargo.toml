@@ -21,6 +21,8 @@ sha2 = "0.10"
 hmac = "0.12"
 indicatif = "0.18"
 rpassword = "7.0"
+rayon = "1.10"
+crossbeam-channel = "0.5"
 
 [dependencies.iced]
 version = "0.13"
