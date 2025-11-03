@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::io::{self, Write};
 
 mod decrypt;
 mod encrypt;
@@ -23,6 +24,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    Backup {
+        #[arg(help = "Source file or directory to backup")]
+        source: String,
+        
+        #[arg(help = "Directory to save the encrypted backup")]
+        backup_dir: String,
+    },
+    Restore {
+        #[arg(help = "Backup file to decrypt")]
+        backup_file: String,
+        
+        #[arg(help = "Output directory for restored files")]
+        output_dir: String,
+    },
     Encrypt {
         #[arg(short, long, help = "Source file or directory to backup")]
         source: String,
@@ -434,10 +449,27 @@ async fn decryption_task(
     .map_err(|e| format!("Task execution error: {}", e))?
 }
 
+fn read_password(prompt: &str) -> io::Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let password = rpassword::read_password()?;
+    Ok(password)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Backup { source, backup_dir }) => {
+            let password = read_password("Enter password: ")?;
+            run_encrypt(&source, &backup_dir, &password)?;
+            Ok(())
+        }
+        Some(Commands::Restore { backup_file, output_dir }) => {
+            let password = read_password("Enter password: ")?;
+            run_decrypt(&backup_file, &output_dir, &password)?;
+            Ok(())
+        }
         Some(Commands::Encrypt { source, backup_dir, password }) => {
             run_encrypt(&source, &backup_dir, &password)?;
             Ok(())

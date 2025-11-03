@@ -7,7 +7,6 @@ use sha2::Sha256;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
-use tar;
 use zstd::stream::write::Encoder;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -17,7 +16,7 @@ const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
 const COMPRESSION_LEVEL: i32 = 1;
-const CHUNK_SIZE: usize = 1024 * 1024;
+const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -27,27 +26,60 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LENGTH] {
     key
 }
 
-fn create_tarball_to_file(source: &Path, output: &Path) -> io::Result<()> {
-    let file = File::create(output)?;
-    let mut ar = tar::Builder::new(file);
+fn compress_and_encrypt_direct(source: &Path, output: &Path, password: &str, pb: &ProgressBar) -> io::Result<()> {
+    let mut salt = [0u8; SALT_LENGTH];
+    rand::rng().fill_bytes(&mut salt);
+    let key = derive_key(password, &salt);
 
-    if source.is_dir() {
-        ar.append_dir_all(
-            source.file_name().unwrap_or_default(),
-            source,
-        )?;
+    let mut nonce = [0u8; NONCE_LENGTH];
+    rand::rng().fill_bytes(&mut nonce);
+
+    let output_file = File::create(output)?;
+    let mut writer = std::io::BufWriter::new(output_file);
+    
+    writer.write_all(&salt)?;
+    writer.write_all(&nonce)?;
+    
+    let temp_compressed = output.with_extension("tmp.zst");
+    
+    pb.set_message("Compressing...");
+    let compressed_size = if source.is_file() {
+        compress_file_direct(source, &temp_compressed, pb)?
     } else {
-        ar.append_path_with_name(source, source.file_name().unwrap_or_default())?;
-    }
+        compress_dir_direct(source, &temp_compressed, pb)?
+    };
+    
+    pb.set_message("Encrypting...");
+    pb.set_length(compressed_size);
+    pb.set_position(0);
+    
+    let mut compressed_file = File::open(&temp_compressed)?;
+    let mut data = Vec::new();
+    compressed_file.read_to_end(&mut data)?;
+    pb.set_position(compressed_size);
+    
+    let cipher = Cipher::aes_256_gcm();
+    let mut tag = vec![0u8; TAG_LENGTH];
+    
+    let ciphertext = encrypt_aead(cipher, &key, Some(&nonce), &[], &data, &mut tag)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-    ar.finish()?;
+    writer.write_all(&ciphertext)?;
+    writer.write_all(&tag)?;
+    
+    fs::remove_file(&temp_compressed)?;
+    
     Ok(())
 }
 
-fn compress_file(input: &Path, output: &Path) -> io::Result<()> {
-    let mut input_file = File::open(input)?;
+fn compress_file_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
+    let mut input_file = File::open(source)?;
+    let input_size = input_file.metadata()?.len();
     let output_file = File::create(output)?;
     let mut encoder = Encoder::new(output_file, COMPRESSION_LEVEL)?;
+
+    pb.set_length(input_size);
+    pb.set_position(0);
 
     let mut buffer = vec![0u8; CHUNK_SIZE];
     loop {
@@ -56,26 +88,87 @@ fn compress_file(input: &Path, output: &Path) -> io::Result<()> {
             break;
         }
         encoder.write_all(&buffer[..n])?;
+        pb.inc(n as u64);
     }
 
     encoder.finish()?;
-    Ok(())
+    Ok(fs::metadata(output)?.len())
 }
 
-fn encrypt_file(input: &Path, output: &mut impl Write, key: &[u8], nonce: &[u8]) -> io::Result<()> {
-    let mut input_file = File::open(input)?;
-    let mut data = Vec::new();
-    input_file.read_to_end(&mut data)?;
-
-    let cipher = Cipher::aes_256_gcm();
-    let mut tag = vec![0u8; TAG_LENGTH];
+fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
+    let output_file = File::create(output)?;
+    let mut encoder = Encoder::new(output_file, COMPRESSION_LEVEL)?;
     
-    let ciphertext = encrypt_aead(cipher, key, Some(nonce), &[], &data, &mut tag)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let total_size = calculate_dir_size(source);
+    pb.set_length(total_size);
+    pb.set_position(0);
+    
+    compress_dir_contents(&mut encoder, source, source, pb)?;
+    
+    encoder.finish()?;
+    Ok(fs::metadata(output)?.len())
+}
 
-    output.write_all(&ciphertext)?;
-    output.write_all(&tag)?;
+fn calculate_dir_size(dir: &Path) -> u64 {
+    let mut size = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = fs::metadata(&path) {
+                    size += metadata.len();
+                }
+            } else if path.is_dir() {
+                size += calculate_dir_size(&path);
+            }
+        }
+    }
+    size
+}
 
+fn compress_dir_contents(encoder: &mut Encoder<File>, base: &Path, current: &Path, pb: &ProgressBar) -> io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        
+        let path = entry.path();
+        
+        if path.is_file() {
+            if let Ok(mut file) = File::open(&path) {
+                let relative = path.strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy();
+                
+                encoder.write_all(format!("FILE:{}\n", relative.len()).as_bytes())?;
+                encoder.write_all(relative.as_bytes())?;
+                
+                if let Ok(metadata) = file.metadata() {
+                    let size = metadata.len();
+                    encoder.write_all(&size.to_le_bytes())?;
+                    
+                    let mut buffer = vec![0u8; CHUNK_SIZE];
+                    let mut remaining = size;
+                    while remaining > 0 {
+                        let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
+                        if let Ok(n) = file.read(&mut buffer[..to_read]) {
+                            if n == 0 {
+                                break;
+                            }
+                            encoder.write_all(&buffer[..n])?;
+                            pb.inc(n as u64);
+                            remaining -= n as u64;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if path.is_dir() {
+            compress_dir_contents(encoder, base, &path, pb)?;
+        }
+    }
     Ok(())
 }
 
@@ -98,7 +191,18 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
     }
 
     if !backup_dir.exists() {
-        fs::create_dir_all(backup_dir)?;
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Backup directory does not exist: {}", backup_dir.display()),
+        ));
+    }
+    
+    let backup_metadata = fs::metadata(backup_dir)?;
+    if !backup_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Backup path must be a directory",
+        ));
     }
 
     let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
@@ -110,53 +214,31 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
     let backup_file_name = format!("{}_{}.backup", source_name, timestamp);
     let backup_path = backup_dir.join(backup_file_name);
 
-    let pb = ProgressBar::new(3);
+    let pb = ProgressBar::new(100);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
             .unwrap()
             .progress_chars("━━╾"),
     );
 
-    pb.set_message("Creating archive...");
-    let temp_tar = std::env::temp_dir().join(format!("zbu_temp_{}.tar", timestamp));
-    create_tarball_to_file(source, &temp_tar)?;
-    let tar_size = fs::metadata(&temp_tar)?.len();
-    pb.inc(1);
+    let original_size = if source.is_file() {
+        fs::metadata(source)?.len()
+    } else {
+        calculate_dir_size(source)
+    };
 
-    pb.set_message("Compressing...");
-    let temp_compressed = std::env::temp_dir().join(format!("zbu_temp_{}.zst", timestamp));
-    compress_file(&temp_tar, &temp_compressed)?;
-    let compressed_size = fs::metadata(&temp_compressed)?.len();
-    fs::remove_file(&temp_tar)?;
-    pb.inc(1);
-
-    pb.set_message("Encrypting...");
-    let mut salt = [0u8; SALT_LENGTH];
-    rand::rng().fill_bytes(&mut salt);
-    let key = derive_key(password, &salt);
-
-    let mut nonce = [0u8; NONCE_LENGTH];
-    rand::rng().fill_bytes(&mut nonce);
-
-    let output_file = fs::File::create(&backup_path)?;
-    let mut writer = std::io::BufWriter::new(output_file);
+    compress_and_encrypt_direct(source, &backup_path, password, &pb)?;
     
-    writer.write_all(&salt)?;
-    writer.write_all(&nonce)?;
-    
-    encrypt_file(&temp_compressed, &mut writer, &key, &nonce)?;
-    fs::remove_file(&temp_compressed)?;
-    pb.inc(1);
+    let final_size = fs::metadata(&backup_path)?.len();
+    let ratio = (final_size as f64 / original_size as f64) * 100.0;
 
     pb.finish_with_message("Complete!");
 
-    let ratio = (compressed_size as f64 / tar_size as f64) * 100.0;
-
     println!("\n✓ Backup created: {}", backup_path.display());
     println!("  {} → {} ({:.1}%)", 
-        format_bytes(tar_size), 
-        format_bytes(compressed_size), 
+        format_bytes(original_size), 
+        format_bytes(final_size), 
         ratio
     );
 

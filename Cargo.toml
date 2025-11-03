@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Your Name <your.email@example.com>"]
 description = "A secure backup utility with AES-256-GCM encryption and Zstandard compression"
 license = "MIT"
-repository = "https://github.com/yourusername/zbu"
+repository = "https://github.com/zedaes/zbu"
 keywords = ["backup", "encryption", "security", "compression", "gui"]
 categories = ["command-line-utilities", "cryptography", "compression"]
 
@@ -20,6 +20,7 @@ pbkdf2 = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
 indicatif = "0.18"
+rpassword = "7.0"
 
 [dependencies.iced]
 version = "0.13"
