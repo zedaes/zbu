@@ -100,7 +100,7 @@ fn compress_file_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::R
 
 fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
     let files = collect_files(source, source)?;
-    let total_size: u64 = files.par_iter()
+    let total_size: u64 = files.iter()
         .filter_map(|(path, _)| fs::metadata(path).ok())
         .map(|m| m.len())
         .sum();
@@ -113,14 +113,18 @@ fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Re
     
     let processed = Arc::new(AtomicU64::new(0));
     
-    let chunks: Vec<Vec<u8>> = files.par_iter()
-        .filter_map(|(path, rel_path)| {
-            compress_file_to_bytes(path, rel_path, &processed, pb).ok()
-        })
-        .collect();
+    const BATCH_SIZE: usize = 100;
     
-    for chunk in chunks {
-        encoder.write_all(&chunk)?;
+    for batch in files.chunks(BATCH_SIZE) {
+        let chunks: Vec<Vec<u8>> = batch.par_iter()
+            .filter_map(|(path, rel_path)| {
+                compress_file_to_bytes(path, rel_path, &processed, pb).ok()
+            })
+            .collect();
+        
+        for chunk in chunks {
+            encoder.write_all(&chunk)?;
+        }
     }
     
     encoder.finish()?;
@@ -173,8 +177,15 @@ fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64
     
     buffer.extend_from_slice(&size.to_le_bytes());
     
-    let mut file_data = Vec::new();
-    file.read_to_end(&mut file_data)?;
+    let mut file_data = Vec::with_capacity(size.min(CHUNK_SIZE as u64) as usize);
+    let mut chunk = vec![0u8; CHUNK_SIZE];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        file_data.extend_from_slice(&chunk[..n]);
+    }
     buffer.extend_from_slice(&file_data);
     
     processed.fetch_add(size, Ordering::Relaxed);
@@ -239,7 +250,7 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "backup".to_string());
     
-    let backup_file_name = format!("{}_{}.backup", source_name, timestamp);
+    let backup_file_name = format!("{}_{}.zbu", source_name, timestamp);
     let backup_path = backup_dir.join(backup_file_name);
 
     let pb = ProgressBar::new(100);
