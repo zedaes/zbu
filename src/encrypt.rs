@@ -19,8 +19,8 @@ const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
 const COMPRESSION_LEVEL: i32 = 3;
-const CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64MB chunks for encryption
-const IO_BUFFER_SIZE: usize = 1024 * 1024; // 1MB for I/O operations
+const CHUNK_SIZE: usize = 64 * 1024 * 1024; 
+const IO_BUFFER_SIZE: usize = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -41,7 +41,6 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
     // Write salt
     writer.write_all(&salt)?;
 
-    // Write placeholder for total chunks count (we'll update this at the end)
     let chunks_count_pos = SALT_LENGTH as u64;
     writer.write_all(&0u32.to_le_bytes())?;
 
@@ -58,7 +57,6 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
     pb.set_length(compressed_size);
     pb.set_position(0);
 
-    // Stream encryption in chunks
     let mut compressed_file = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(&temp_compressed)?);
     let mut chunk_buffer = vec![0u8; CHUNK_SIZE];
     let mut chunk_counter = 0u32;
@@ -66,7 +64,6 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
 
     loop {
         let mut total_read = 0;
-        // Read up to CHUNK_SIZE bytes
         while total_read < CHUNK_SIZE {
             match compressed_file.read(&mut chunk_buffer[total_read..]) {
                 Ok(0) => break, // EOF
@@ -77,12 +74,11 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
         }
 
         if total_read == 0 {
-            break; // EOF
+            break;
         }
 
         let chunk_data = &chunk_buffer[..total_read];
 
-        // Generate unique nonce for each chunk
         let mut nonce = [0u8; NONCE_LENGTH];
         rand::rng().fill_bytes(&mut nonce);
 
@@ -90,7 +86,6 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
         let ciphertext = encrypt_aead(cipher, &key, Some(&nonce), &[], chunk_data, &mut tag)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-        // Write: chunk_size (4 bytes) + nonce (12 bytes) + ciphertext + tag (16 bytes)
         writer.write_all(&(ciphertext.len() as u32).to_le_bytes())?;
         writer.write_all(&nonce)?;
         writer.write_all(&ciphertext)?;
@@ -103,7 +98,6 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
     writer.flush()?;
     drop(writer);
 
-    // Update chunks count at the beginning of file
     let mut file = fs::OpenOptions::new()
         .write(true)
         .open(output)?;
@@ -157,7 +151,6 @@ fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Re
 
     let processed = Arc::new(AtomicU64::new(0));
 
-    // Increased batch size for better throughput
     const BATCH_SIZE: usize = 500;
 
     for batch in files.chunks(BATCH_SIZE) {
@@ -188,7 +181,6 @@ fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String
         return Ok(files);
     }
 
-    // Use parallel directory traversal for large directory trees
     let entries: Vec<_> = fs::read_dir(current)?
         .filter_map(|entry| entry.ok())
         .collect();
@@ -196,7 +188,6 @@ fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String
     let (dirs, file_entries): (Vec<_>, Vec<_>) = entries.into_iter()
         .partition(|e| e.path().is_dir());
 
-    // Add files from current directory
     for entry in file_entries {
         let path = entry.path();
         let rel = path.strip_prefix(base)
@@ -206,7 +197,6 @@ fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String
         files.push((path, rel));
     }
 
-    // Recursively process subdirectories
     for dir_entry in dirs {
         files.extend(collect_files(base, &dir_entry.path())?);
     }
@@ -217,7 +207,6 @@ fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String
 fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64>, pb: &ProgressBar) -> io::Result<Vec<u8>> {
     let mut buffer = Vec::new();
 
-    // Write file header
     buffer.extend_from_slice(format!("FILE:{}\n", rel_path.len()).as_bytes());
     buffer.extend_from_slice(rel_path.as_bytes());
 
@@ -227,7 +216,6 @@ fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64
 
     buffer.extend_from_slice(&size.to_le_bytes());
 
-    // Stream file data instead of loading all at once
     let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
     let mut chunk = vec![0u8; IO_BUFFER_SIZE];
 
