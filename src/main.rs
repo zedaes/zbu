@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 
+#[cfg(feature = "gui")]
+use std::path::PathBuf;
+
 mod decrypt;
 mod encrypt;
 

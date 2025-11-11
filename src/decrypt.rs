@@ -4,7 +4,7 @@ use pbkdf2::pbkdf2;
 use sha2::Sha256;
 use std::fs;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::path::Path;
 use zstd::stream::read::Decoder;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -14,7 +14,7 @@ const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
-const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const IO_BUFFER_SIZE: usize = 1024 * 1024; // 1MB for I/O operations
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -24,55 +24,92 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LENGTH] {
     key
 }
 
-fn decrypt_and_decompress_direct(input_file: &mut File, output_dir: &Path, key: &[u8], nonce: &[u8], pb: &ProgressBar) -> io::Result<()> {
-    let mut ciphertext = Vec::new();
-    
-    pb.set_message("Reading encrypted data...");
-    input_file.read_to_end(&mut ciphertext)?;
-
-    if ciphertext.len() < TAG_LENGTH {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Encrypted data too short",
-        ));
-    }
-
-    pb.set_message("Decrypting...");
-    let tag_start = ciphertext.len() - TAG_LENGTH;
-    let tag = &ciphertext[tag_start..];
-    let encrypted = &ciphertext[..tag_start];
+fn decrypt_and_decompress_streaming(
+    input_file: &mut BufReader<File>,
+    output_dir: &Path,
+    key: &[u8],
+    total_chunks: u32,
+    pb: &ProgressBar,
+) -> io::Result<()> {
+    pb.set_message("Decrypting and decompressing...");
+    pb.set_length(total_chunks as u64);
+    pb.set_position(0);
 
     let cipher = Cipher::aes_256_gcm();
-    let plaintext = decrypt_aead(cipher, key, Some(nonce), &[], encrypted, tag)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-    pb.set_message("Decompressing...");
-    let mut decoder = Decoder::new(plaintext.as_slice())?;
-    
+    // Create a temporary file for decompressed data
+    let temp_dir = std::env::temp_dir();
+    let temp_decompressed = temp_dir.join(format!("zbu_decrypt_{}.tmp", std::process::id()));
+
+    let temp_file = File::create(&temp_decompressed)?;
+    let mut temp_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, temp_file);
+
+    // Decrypt all chunks and write to temp file
+    for _ in 0..total_chunks {
+        // Read chunk size (4 bytes)
+        let mut chunk_size_bytes = [0u8; 4];
+        input_file.read_exact(&mut chunk_size_bytes)?;
+        let chunk_size = u32::from_le_bytes(chunk_size_bytes) as usize;
+
+        // Read nonce (12 bytes)
+        let mut nonce = [0u8; NONCE_LENGTH];
+        input_file.read_exact(&mut nonce)?;
+
+        // Read ciphertext
+        let mut ciphertext = vec![0u8; chunk_size];
+        input_file.read_exact(&mut ciphertext)?;
+
+        // Read tag (16 bytes)
+        let mut tag = [0u8; TAG_LENGTH];
+        input_file.read_exact(&mut tag)?;
+
+        // Decrypt chunk
+        let plaintext = decrypt_aead(cipher, key, Some(&nonce), &[], &ciphertext, &tag)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))?;
+
+        temp_writer.write_all(&plaintext)?;
+        pb.inc(1);
+    }
+
+    temp_writer.flush()?;
+    drop(temp_writer);
+
+    // Now decompress from temp file
+    pb.set_message("Extracting files...");
+
+    let temp_file = File::open(&temp_decompressed)?;
+    let temp_reader = BufReader::with_capacity(IO_BUFFER_SIZE, temp_file);
+    let mut decoder = Decoder::new(temp_reader)?;
+
     if !output_dir.exists() {
         fs::create_dir_all(output_dir)?;
     }
-    
+
     extract_files(&mut decoder, output_dir)?;
-    
+
+    // Clean up temp file
+    fs::remove_file(&temp_decompressed)?;
+
     Ok(())
 }
 
 fn extract_files<R: Read>(decoder: &mut R, output_dir: &Path) -> io::Result<()> {
-    let mut buffer = vec![0u8; CHUNK_SIZE];
-    
+    let mut buffer = vec![0u8; IO_BUFFER_SIZE];
+
     loop {
+        // Read file header
         let mut header = [0u8; 5];
         match decoder.read_exact(&mut header) {
             Ok(_) => {},
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
         }
-        
+
         if &header != b"FILE:" {
             break;
         }
-        
+
+        // Read path length
         let mut path_len_str = String::new();
         loop {
             let mut byte = [0u8; 1];
@@ -82,37 +119,44 @@ fn extract_files<R: Read>(decoder: &mut R, output_dir: &Path) -> io::Result<()> 
             }
             path_len_str.push(byte[0] as char);
         }
-        
+
         let path_len: usize = path_len_str.parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid path length"))?;
-        
+
+        // Read file path
         let mut path_bytes = vec![0u8; path_len];
         decoder.read_exact(&mut path_bytes)?;
         let relative_path = String::from_utf8_lossy(&path_bytes);
-        
+
+        // Read file size
         let mut size_bytes = [0u8; 8];
         decoder.read_exact(&mut size_bytes)?;
         let file_size = u64::from_le_bytes(size_bytes);
-        
+
+        // Create output file
         let output_path = output_dir.join(relative_path.as_ref());
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        
-        let mut output_file = File::create(&output_path)?;
+
+        let output_file = File::create(&output_path)?;
+        let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
         let mut remaining = file_size;
-        
+
+        // Stream file data
         while remaining > 0 {
-            let to_read = remaining.min(CHUNK_SIZE as u64) as usize;
+            let to_read = remaining.min(IO_BUFFER_SIZE as u64) as usize;
             let n = decoder.read(&mut buffer[..to_read])?;
             if n == 0 {
                 break;
             }
-            output_file.write_all(&buffer[..n])?;
+            writer.write_all(&buffer[..n])?;
             remaining -= n as u64;
         }
+
+        writer.flush()?;
     }
-    
+
     Ok(())
 }
 
@@ -138,7 +182,7 @@ pub fn run_decrypt(
         ));
     }
 
-    let pb = ProgressBar::new(3);
+    let pb = ProgressBar::new(100);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -146,11 +190,11 @@ pub fn run_decrypt(
             .progress_chars("━━╾"),
     );
 
-    pb.set_message("Reading file...");
-    let mut file = File::open(backup_file)?;
-    
+    pb.set_message("Reading backup file...");
+    let file = File::open(backup_file)?;
     let file_size = file.metadata()?.len();
-    let min_size = (SALT_LENGTH + NONCE_LENGTH + TAG_LENGTH) as u64;
+
+    let min_size = (SALT_LENGTH + 4) as u64; // salt + chunk count
     if file_size < min_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -161,17 +205,27 @@ pub fn run_decrypt(
         ));
     }
 
+    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
+
+    // Read salt
     let mut salt = [0u8; SALT_LENGTH];
-    let mut nonce = [0u8; NONCE_LENGTH];
-    file.read_exact(&mut salt)?;
-    file.read_exact(&mut nonce)?;
+    reader.read_exact(&mut salt)?;
+
+    // Read total chunks count
+    let mut chunks_count_bytes = [0u8; 4];
+    reader.read_exact(&mut chunks_count_bytes)?;
+    let total_chunks = u32::from_le_bytes(chunks_count_bytes);
+
+    if total_chunks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid backup file: no chunks found",
+        ));
+    }
 
     let key = derive_key(password, &salt);
-    pb.inc(1);
 
-    pb.set_message("Processing...");
-    decrypt_and_decompress_direct(&mut file, output_dir, &key, &nonce, &pb)?;
-    pb.inc(1);
+    decrypt_and_decompress_streaming(&mut reader, output_dir, &key, total_chunks, &pb)?;
 
     pb.finish_with_message("Complete!");
 

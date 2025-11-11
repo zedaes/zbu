@@ -5,7 +5,7 @@ use pbkdf2::pbkdf2;
 use rand::RngCore;
 use sha2::Sha256;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,8 +18,9 @@ const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
-const COMPRESSION_LEVEL: i32 = 1;
-const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+const COMPRESSION_LEVEL: i32 = 3;
+const CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64MB chunks for encryption
+const IO_BUFFER_SIZE: usize = 1024 * 1024; // 1MB for I/O operations
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -29,64 +30,106 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LENGTH] {
     key
 }
 
-fn compress_and_encrypt_direct(source: &Path, output: &Path, password: &str, pb: &ProgressBar) -> io::Result<()> {
+fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, pb: &ProgressBar) -> io::Result<()> {
     let mut salt = [0u8; SALT_LENGTH];
     rand::rng().fill_bytes(&mut salt);
     let key = derive_key(password, &salt);
 
-    let mut nonce = [0u8; NONCE_LENGTH];
-    rand::rng().fill_bytes(&mut nonce);
-
     let output_file = File::create(output)?;
-    let mut writer = std::io::BufWriter::new(output_file);
-    
+    let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
+
+    // Write salt
     writer.write_all(&salt)?;
-    writer.write_all(&nonce)?;
-    
+
+    // Write placeholder for total chunks count (we'll update this at the end)
+    let chunks_count_pos = SALT_LENGTH as u64;
+    writer.write_all(&0u32.to_le_bytes())?;
+
     let temp_compressed = output.with_extension("tmp.zst");
-    
+
     pb.set_message("Compressing...");
     let compressed_size = if source.is_file() {
         compress_file_direct(source, &temp_compressed, pb)?
     } else {
         compress_dir_direct(source, &temp_compressed, pb)?
     };
-    
+
     pb.set_message("Encrypting...");
     pb.set_length(compressed_size);
     pb.set_position(0);
-    
-    let mut compressed_file = File::open(&temp_compressed)?;
-    let mut data = Vec::new();
-    compressed_file.read_to_end(&mut data)?;
-    pb.set_position(compressed_size);
-    
-    let cipher = Cipher::aes_256_gcm();
-    let mut tag = vec![0u8; TAG_LENGTH];
-    
-    let ciphertext = encrypt_aead(cipher, &key, Some(&nonce), &[], &data, &mut tag)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-    writer.write_all(&ciphertext)?;
-    writer.write_all(&tag)?;
-    
+    // Stream encryption in chunks
+    let mut compressed_file = BufReader::with_capacity(IO_BUFFER_SIZE, File::open(&temp_compressed)?);
+    let mut chunk_buffer = vec![0u8; CHUNK_SIZE];
+    let mut chunk_counter = 0u32;
+    let cipher = Cipher::aes_256_gcm();
+
+    loop {
+        let mut total_read = 0;
+        // Read up to CHUNK_SIZE bytes
+        while total_read < CHUNK_SIZE {
+            match compressed_file.read(&mut chunk_buffer[total_read..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => total_read += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        if total_read == 0 {
+            break; // EOF
+        }
+
+        let chunk_data = &chunk_buffer[..total_read];
+
+        // Generate unique nonce for each chunk
+        let mut nonce = [0u8; NONCE_LENGTH];
+        rand::rng().fill_bytes(&mut nonce);
+
+        let mut tag = vec![0u8; TAG_LENGTH];
+        let ciphertext = encrypt_aead(cipher, &key, Some(&nonce), &[], chunk_data, &mut tag)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        // Write: chunk_size (4 bytes) + nonce (12 bytes) + ciphertext + tag (16 bytes)
+        writer.write_all(&(ciphertext.len() as u32).to_le_bytes())?;
+        writer.write_all(&nonce)?;
+        writer.write_all(&ciphertext)?;
+        writer.write_all(&tag)?;
+
+        chunk_counter += 1;
+        pb.inc(total_read as u64);
+    }
+
+    writer.flush()?;
+    drop(writer);
+
+    // Update chunks count at the beginning of file
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(output)?;
+    file.seek(io::SeekFrom::Start(chunks_count_pos))?;
+    file.write_all(&chunk_counter.to_le_bytes())?;
+
     fs::remove_file(&temp_compressed)?;
-    
+
     Ok(())
 }
 
 fn compress_file_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
-    let mut input_file = File::open(source)?;
+    let input_file = File::open(source)?;
     let input_size = input_file.metadata()?.len();
+    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, input_file);
+
     let output_file = File::create(output)?;
-    let mut encoder = Encoder::new(output_file, COMPRESSION_LEVEL)?;
+    let buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
+    let mut encoder = Encoder::new(buf_writer, COMPRESSION_LEVEL)?;
 
     pb.set_length(input_size);
     pb.set_position(0);
 
-    let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut buffer = vec![0u8; IO_BUFFER_SIZE];
     loop {
-        let n = input_file.read(&mut buffer)?;
+        let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;
         }
@@ -100,40 +143,42 @@ fn compress_file_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::R
 
 fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
     let files = collect_files(source, source)?;
-    let total_size: u64 = files.iter()
+    let total_size: u64 = files.par_iter()
         .filter_map(|(path, _)| fs::metadata(path).ok())
         .map(|m| m.len())
         .sum();
-    
+
     pb.set_length(total_size);
     pb.set_position(0);
-    
+
     let output_file = File::create(output)?;
-    let mut encoder = Encoder::new(output_file, COMPRESSION_LEVEL)?;
-    
+    let buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE * 4, output_file);
+    let mut encoder = Encoder::new(buf_writer, COMPRESSION_LEVEL)?;
+
     let processed = Arc::new(AtomicU64::new(0));
-    
-    const BATCH_SIZE: usize = 100;
-    
+
+    // Increased batch size for better throughput
+    const BATCH_SIZE: usize = 500;
+
     for batch in files.chunks(BATCH_SIZE) {
         let chunks: Vec<Vec<u8>> = batch.par_iter()
             .filter_map(|(path, rel_path)| {
                 compress_file_to_bytes(path, rel_path, &processed, pb).ok()
             })
             .collect();
-        
+
         for chunk in chunks {
             encoder.write_all(&chunk)?;
         }
     }
-    
+
     encoder.finish()?;
     Ok(fs::metadata(output)?.len())
 }
 
 fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String)>> {
     let mut files = Vec::new();
-    
+
     if current.is_file() {
         let rel = current.strip_prefix(base)
             .unwrap_or(current)
@@ -142,73 +187,72 @@ fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String
         files.push((current.to_path_buf(), rel));
         return Ok(files);
     }
-    
-    for entry in fs::read_dir(current)? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        
+
+    // Use parallel directory traversal for large directory trees
+    let entries: Vec<_> = fs::read_dir(current)?
+        .filter_map(|entry| entry.ok())
+        .collect();
+
+    let (dirs, file_entries): (Vec<_>, Vec<_>) = entries.into_iter()
+        .partition(|e| e.path().is_dir());
+
+    // Add files from current directory
+    for entry in file_entries {
         let path = entry.path();
-        
-        if path.is_file() {
-            let rel = path.strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            files.push((path, rel));
-        } else if path.is_dir() {
-            files.extend(collect_files(base, &path)?);
-        }
+        let rel = path.strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        files.push((path, rel));
     }
-    
+
+    // Recursively process subdirectories
+    for dir_entry in dirs {
+        files.extend(collect_files(base, &dir_entry.path())?);
+    }
+
     Ok(files)
 }
 
 fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64>, pb: &ProgressBar) -> io::Result<Vec<u8>> {
     let mut buffer = Vec::new();
-    
+
+    // Write file header
     buffer.extend_from_slice(format!("FILE:{}\n", rel_path.len()).as_bytes());
     buffer.extend_from_slice(rel_path.as_bytes());
-    
-    let mut file = File::open(path)?;
+
+    let file = File::open(path)?;
     let metadata = file.metadata()?;
     let size = metadata.len();
-    
+
     buffer.extend_from_slice(&size.to_le_bytes());
-    
-    let mut file_data = Vec::with_capacity(size.min(CHUNK_SIZE as u64) as usize);
-    let mut chunk = vec![0u8; CHUNK_SIZE];
+
+    // Stream file data instead of loading all at once
+    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
+    let mut chunk = vec![0u8; IO_BUFFER_SIZE];
+
     loop {
-        let n = file.read(&mut chunk)?;
+        let n = reader.read(&mut chunk)?;
         if n == 0 {
             break;
         }
-        file_data.extend_from_slice(&chunk[..n]);
+        buffer.extend_from_slice(&chunk[..n]);
     }
-    buffer.extend_from_slice(&file_data);
-    
+
     processed.fetch_add(size, Ordering::Relaxed);
     pb.set_position(processed.load(Ordering::Relaxed));
-    
+
     Ok(buffer)
 }
 
 fn calculate_dir_size(dir: &Path) -> u64 {
-    let mut size = 0u64;
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = fs::metadata(&path) {
-                    size += metadata.len();
-                }
-            } else if path.is_dir() {
-                size += calculate_dir_size(&path);
-            }
-        }
-    }
-    size
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::Result<()> {
@@ -221,7 +265,7 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
             format!("Source path does not exist: {}", source_path),
         ));
     }
-    
+
     if password.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -235,7 +279,7 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
             format!("Backup directory does not exist: {}", backup_dir.display()),
         ));
     }
-    
+
     let backup_metadata = fs::metadata(backup_dir)?;
     if !backup_metadata.is_dir() {
         return Err(io::Error::new(
@@ -249,7 +293,7 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "backup".to_string());
-    
+
     let backup_file_name = format!("{}_{}.zbu", source_name, timestamp);
     let backup_path = backup_dir.join(backup_file_name);
 
@@ -264,20 +308,21 @@ pub fn run_encrypt(source_path: &str, backup_dir: &str, password: &str) -> io::R
     let original_size = if source.is_file() {
         fs::metadata(source)?.len()
     } else {
+        pb.set_message("Calculating size...");
         calculate_dir_size(source)
     };
 
-    compress_and_encrypt_direct(source, &backup_path, password, &pb)?;
-    
+    compress_and_encrypt_streaming(source, &backup_path, password, &pb)?;
+
     let final_size = fs::metadata(&backup_path)?.len();
     let ratio = (final_size as f64 / original_size as f64) * 100.0;
 
     pb.finish_with_message("Complete!");
 
     println!("\n✓ Backup created: {}", backup_path.display());
-    println!("  {} → {} ({:.1}%)", 
-        format_bytes(original_size), 
-        format_bytes(final_size), 
+    println!("  {} → {} ({:.1}%)",
+        format_bytes(original_size),
+        format_bytes(final_size),
         ratio
     );
 
@@ -300,4 +345,4 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-
+use std::io::Seek;
