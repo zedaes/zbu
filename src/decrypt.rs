@@ -14,7 +14,8 @@ const KEY_LENGTH: usize = 32;
 const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
-const IO_BUFFER_SIZE: usize = 1024 * 1024; 
+const IO_BUFFER_SIZE: usize = 1024 * 1024;
+const FILE_MAGIC: &[u8; 4] = b"ZBU\x01";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -22,6 +23,45 @@ fn derive_key(password: &str, salt: &[u8]) -> [u8; KEY_LENGTH] {
     let mut key = [0u8; KEY_LENGTH];
     let _ = pbkdf2::<HmacSha256>(password.as_bytes(), salt, PBKDF2_ITERATIONS, &mut key);
     key
+}
+
+fn decrypt_and_decompress_legacy(
+    input_file: &mut BufReader<File>,
+    output_dir: &Path,
+    key: &[u8],
+    nonce: &[u8],
+    pb: &ProgressBar,
+) -> io::Result<()> {
+    pb.set_message("Decrypting (legacy format)...");
+
+    let mut ciphertext = Vec::new();
+    input_file.read_to_end(&mut ciphertext)?;
+
+    if ciphertext.len() < TAG_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Encrypted data too short",
+        ));
+    }
+
+    let tag_start = ciphertext.len() - TAG_LENGTH;
+    let tag = &ciphertext[tag_start..];
+    let encrypted = &ciphertext[..tag_start];
+
+    let cipher = Cipher::aes_256_gcm();
+    let plaintext = decrypt_aead(cipher, key, Some(nonce), &[], encrypted, tag)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Decryption failed: {}", e)))?;
+
+    pb.set_message("Decompressing...");
+    let mut decoder = Decoder::new(plaintext.as_slice())?;
+
+    if !output_dir.exists() {
+        fs::create_dir_all(output_dir)?;
+    }
+
+    extract_files(&mut decoder, output_dir)?;
+
+    Ok(())
 }
 
 fn decrypt_and_decompress_streaming(
@@ -192,23 +232,41 @@ pub fn run_decrypt(
 
     let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
 
-    let mut salt = [0u8; SALT_LENGTH];
-    reader.read_exact(&mut salt)?;
+    let mut magic_or_salt_start = [0u8; 4];
+    reader.read_exact(&mut magic_or_salt_start)?;
 
-    let mut chunks_count_bytes = [0u8; 4];
-    reader.read_exact(&mut chunks_count_bytes)?;
-    let total_chunks = u32::from_le_bytes(chunks_count_bytes);
+    if &magic_or_salt_start == FILE_MAGIC {
+        pb.set_message("Detected new format");
 
-    if total_chunks == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid backup file: no chunks found",
-        ));
+        let mut salt = [0u8; SALT_LENGTH];
+        reader.read_exact(&mut salt)?;
+
+        let mut chunks_count_bytes = [0u8; 4];
+        reader.read_exact(&mut chunks_count_bytes)?;
+        let total_chunks = u32::from_le_bytes(chunks_count_bytes);
+
+        if total_chunks == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid backup file: no chunks found",
+            ));
+        }
+
+        let key = derive_key(password, &salt);
+        decrypt_and_decompress_streaming(&mut reader, output_dir, &key, total_chunks, &pb)?;
+    } else {
+        pb.set_message("Detected legacy format");
+
+        let mut salt = [0u8; SALT_LENGTH];
+        salt[0..4].copy_from_slice(&magic_or_salt_start);
+        reader.read_exact(&mut salt[4..])?;
+
+        let mut nonce = [0u8; NONCE_LENGTH];
+        reader.read_exact(&mut nonce)?;
+
+        let key = derive_key(password, &salt);
+        decrypt_and_decompress_legacy(&mut reader, output_dir, &key, &nonce, &pb)?;
     }
-
-    let key = derive_key(password, &salt);
-
-    decrypt_and_decompress_streaming(&mut reader, output_dir, &key, total_chunks, &pb)?;
 
     pb.finish_with_message("Complete!");
 

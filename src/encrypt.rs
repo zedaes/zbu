@@ -19,8 +19,9 @@ const SALT_LENGTH: usize = 16;
 const NONCE_LENGTH: usize = 12;
 const TAG_LENGTH: usize = 16;
 const COMPRESSION_LEVEL: i32 = 3;
-const CHUNK_SIZE: usize = 64 * 1024 * 1024; 
+const CHUNK_SIZE: usize = 64 * 1024 * 1024;
 const IO_BUFFER_SIZE: usize = 1024 * 1024;
+const FILE_MAGIC: &[u8; 4] = b"ZBU\x01";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,10 +39,10 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
     let output_file = File::create(output)?;
     let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
 
-    // Write salt
+    writer.write_all(FILE_MAGIC)?;
     writer.write_all(&salt)?;
 
-    let chunks_count_pos = SALT_LENGTH as u64;
+    let chunks_count_pos = (FILE_MAGIC.len() + SALT_LENGTH) as u64;
     writer.write_all(&0u32.to_le_bytes())?;
 
     let temp_compressed = output.with_extension("tmp.zst");
@@ -112,15 +113,23 @@ fn compress_and_encrypt_streaming(source: &Path, output: &Path, password: &str, 
 fn compress_file_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Result<u64> {
     let input_file = File::open(source)?;
     let input_size = input_file.metadata()?.len();
-    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, input_file);
+
+    pb.set_length(input_size);
+    pb.set_position(0);
 
     let output_file = File::create(output)?;
     let buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
     let mut encoder = Encoder::new(buf_writer, COMPRESSION_LEVEL)?;
 
-    pb.set_length(input_size);
-    pb.set_position(0);
+    let file_name = source.file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file name"))?
+        .to_string_lossy();
 
+    encoder.write_all(format!("FILE:{}\n", file_name.len()).as_bytes())?;
+    encoder.write_all(file_name.as_bytes())?;
+    encoder.write_all(&input_size.to_le_bytes())?;
+
+    let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, input_file);
     let mut buffer = vec![0u8; IO_BUFFER_SIZE];
     loop {
         let n = reader.read(&mut buffer)?;

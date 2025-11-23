@@ -47,9 +47,6 @@ enum Commands {
         
         #[arg(short, long, help = "Directory to save the encrypted backup")]
         backup_dir: String,
-        
-        #[arg(short, long, help = "Password for encryption")]
-        password: String,
     },
     Decrypt {
         #[arg(short, long, help = "Backup file to decrypt")]
@@ -57,9 +54,6 @@ enum Commands {
         
         #[arg(short, long, help = "Output directory for restored files")]
         output_dir: String,
-        
-        #[arg(short, long, help = "Password for decryption")]
-        password: String,
     },
 }
 
@@ -473,11 +467,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_decrypt(&backup_file, &output_dir, &password)?;
             Ok(())
         }
-        Some(Commands::Encrypt { source, backup_dir, password }) => {
+        Some(Commands::Encrypt { source, backup_dir }) => {
+            let password = read_password("Enter encryption password: ")?;
             run_encrypt(&source, &backup_dir, &password)?;
             Ok(())
         }
-        Some(Commands::Decrypt { backup_file, output_dir, password }) => {
+        Some(Commands::Decrypt { backup_file, output_dir }) => {
+            let password = read_password("Enter decryption password: ")?;
             run_decrypt(&backup_file, &output_dir, &password)?;
             Ok(())
         }
