@@ -7,8 +7,6 @@ use sha2::Sha256;
 use std::fs::{self, File};
 use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use zstd::stream::write::Encoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -158,19 +156,11 @@ fn compress_dir_direct(source: &Path, output: &Path, pb: &ProgressBar) -> io::Re
     let buf_writer = BufWriter::with_capacity(IO_BUFFER_SIZE * 4, output_file);
     let mut encoder = Encoder::new(buf_writer, COMPRESSION_LEVEL)?;
 
-    let processed = Arc::new(AtomicU64::new(0));
-
-    const BATCH_SIZE: usize = 500;
-
-    for batch in files.chunks(BATCH_SIZE) {
-        let chunks: Vec<Vec<u8>> = batch.par_iter()
-            .filter_map(|(path, rel_path)| {
-                compress_file_to_bytes(path, rel_path, &processed, pb).ok()
-            })
-            .collect();
-
-        for chunk in chunks {
-            encoder.write_all(&chunk)?;
+    // Process files sequentially to avoid massive memory consumption
+    for (path, rel_path) in files.iter() {
+        if let Err(e) = write_file_to_encoder(path, rel_path, &mut encoder, pb) {
+            eprintln!("Warning: Failed to process {}: {}", path.display(), e);
+            continue;
         }
     }
 
@@ -213,18 +203,23 @@ fn collect_files(base: &Path, current: &Path) -> io::Result<Vec<(PathBuf, String
     Ok(files)
 }
 
-fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64>, pb: &ProgressBar) -> io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-
-    buffer.extend_from_slice(format!("FILE:{}\n", rel_path.len()).as_bytes());
-    buffer.extend_from_slice(rel_path.as_bytes());
+fn write_file_to_encoder<W: Write>(
+    path: &Path,
+    rel_path: &str,
+    encoder: &mut W,
+    pb: &ProgressBar,
+) -> io::Result<()> {
+    // Write file header
+    encoder.write_all(format!("FILE:{}\n", rel_path.len()).as_bytes())?;
+    encoder.write_all(rel_path.as_bytes())?;
 
     let file = File::open(path)?;
     let metadata = file.metadata()?;
     let size = metadata.len();
 
-    buffer.extend_from_slice(&size.to_le_bytes());
+    encoder.write_all(&size.to_le_bytes())?;
 
+    // Stream file contents directly to encoder without buffering entire file in memory
     let mut reader = BufReader::with_capacity(IO_BUFFER_SIZE, file);
     let mut chunk = vec![0u8; IO_BUFFER_SIZE];
 
@@ -233,13 +228,11 @@ fn compress_file_to_bytes(path: &Path, rel_path: &str, processed: &Arc<AtomicU64
         if n == 0 {
             break;
         }
-        buffer.extend_from_slice(&chunk[..n]);
+        encoder.write_all(&chunk[..n])?;
+        pb.inc(n as u64);
     }
 
-    processed.fetch_add(size, Ordering::Relaxed);
-    pb.set_position(processed.load(Ordering::Relaxed));
-
-    Ok(buffer)
+    Ok(())
 }
 
 fn calculate_dir_size(dir: &Path) -> u64 {
