@@ -447,6 +447,13 @@ async fn decryption_task(
 }
 
 fn read_password(prompt: &str) -> io::Result<String> {
+    // Check for password in environment variable first
+    if let Ok(password) = std::env::var("ZBU_PASSWORD") {
+        if !password.is_empty() {
+            return Ok(password);
+        }
+    }
+
     print!("{}", prompt);
     io::stdout().flush()?;
     let password = rpassword::read_password()?;
